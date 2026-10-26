@@ -1,43 +1,133 @@
 ---
 title: Upgrade or uninstall
-description: Upgrade or remove a single-VM install, or a Terraform install on AWS, Azure, or Google Cloud.
+description: Back up, upgrade, or remove a single-VM installation, or manage a Terraform cloud installation.
 ---
 
 import { Aside, Tabs, TabItem } from "@astrojs/starlight/components";
 
-Use the section that matches the install. A [single VM](/self-hosting/single-vm) upgrades with `./install.sh`. A [cloud install](/self-hosting/install) upgrades with Terraform.
+Use this page to preserve data before maintenance and remove only the resources from your installation. A [single VM](/self-hosting/single-vm) uses the release package. A [cloud install](/self-hosting/install) uses Terraform.
+
+## Back up a single VM
+
+Use a backup procedure that you tested for your environment. Before maintenance:
+
+- Stop new work and wait for current tasks to finish.
+- For a cold backup, stop local runners and all Compose services before you copy volumes.
+- Preserve the installation configuration, original secrets, OIDC keys, and all project data volumes.
+- Record the release, component images, architecture, hostname, and Compose project.
+- Keep a verified copy outside the VM with restricted access.
+
+Do not copy live PostgreSQL files as a cold backup. Test restoration before you rely on the backup.
+
+### Restore a single VM
+
+Confirm these conditions before restoration:
+
+- The archive is trusted and its checksums pass.
+- The original release, component images, and architecture are available.
+- The target installation is stopped and its data volumes are empty.
+- The original configuration, secrets, ownership, and file permissions can be restored.
+
+Check service health, owner access, and restored data before you accept new work. Do not generate replacement secrets for data encrypted with the original values.
 
 ## Upgrade a single VM
 
-Download the new `superplane-single-host.tar.gz` from the [SuperPlane releases](https://github.com/superplanehq/superplane/releases). From the existing install directory, replace the Compose file and `install.sh`. Leave `superplane.env`, `oidc/`, `fleet-manager.env`, and `Caddyfile` in place.
+Back up the installation first. Select the target [SuperPlane release](https://github.com/superplanehq/superplane/releases) and follow the [download and checksum steps](/self-hosting/single-vm#2-download-the-release). Use the checksum file from that target release.
+
+From the existing installation directory, replace the Compose file and packaged scripts. Keep the existing environment files, `oidc/`, and `Caddyfile`. Set the archive path below to your verified download:
 
 ```bash
-mkdir -p /tmp/superplane-release
-tar -C /tmp/superplane-release -xzf superplane-single-host.tar.gz
-cp /tmp/superplane-release/superplane/docker-compose.yml .
-cp /tmp/superplane-release/superplane/install.sh .
-chmod +x install.sh
+release_dir=$(mktemp -d /tmp/superplane-release.XXXXXX)
+tar -C "$release_dir" -xzf /absolute/path/superplane-single-host.tar.gz
+cp "$release_dir/superplane/docker-compose.yml" .
+for script in install.sh uninstall.sh diagnose.sh; do
+  if [ -f "$release_dir/superplane/$script" ]; then
+    cp "$release_dir/superplane/$script" "./$script"
+    chmod +x "./$script"
+  fi
+done
 ./install.sh
 ```
 
-`./install.sh` keeps the existing secrets, pulls the new images, and migrates the database when the app starts. It starts Fleet Manager with the other services. Confirm the health check:
+The installer keeps existing secrets and regenerates derived configuration, including `fleet-manager.yaml` and `rabbitmq.env`. It pulls the packaged images and starts database migrations with the application. Use the [installation checks](/self-hosting/single-vm#4-verify-the-installation), then confirm owner access and existing data.
 
-```bash
-docker compose ps
-curl -fsS "https://superplane.example.com/health"
-```
+Do not assume that replacing an image with an older version reverses a database migration. Keep the original backup until you validate the upgrade. If recovery is necessary, restore the complete backup with its original release.
 
 ## Uninstall a single VM
 
-<Aside type="danger" title="Uninstall deletes the data">
-Copy a backup off the VM first. `docker compose down -v` deletes the database, uploaded files, and certificates.
-</Aside>
+Stop new work and wait for current tasks to finish. Run removal commands from the installation directory. Container removal does not delete the VM or its cloud disks.
+
+### Packages with `uninstall.sh`
+
+Use this section only if your release package includes `uninstall.sh`. The `v1.0.0-rc7` package does not include it; use the manual procedure below.
+
+By default, the script removes this installation's services, managed runners, and project network. It preserves named data volumes and host configuration. It refuses running runners unless you explicitly allow their interruption with `--force`.
+
+When you preserve data, the application API must be available to retire this installation's runners. The script waits up to 60 seconds for retirement before it removes runner containers. If retirement fails, the application and runner containers remain; run `./install.sh` to resume before you retry.
+
+After you verify that work is finished, remove the installation while preserving its data:
 
 ```bash
-docker compose down -v --remove-orphans
+./uninstall.sh --force
 ```
 
-Delete `superplane.env`, `fleet-manager.env`, and `oidc/` after the backup is stored somewhere else.
+Review the confirmation before you continue. The `--force` flag permits cancellation; it does not guarantee immediate cancellation or drain work automatically. The separate `--yes` flag skips confirmation for an unattended command.
+
+Run `./install.sh` from the same directory to resume with the preserved data and configuration.
+
+Choose preservation or purge before removal. If you already removed the services while preserving volumes, resume the installation before you use `--purge`. The script requires ownership information from existing Compose containers before it deletes retained volumes.
+
+<Aside type="danger" title="Purge deletes project data">
+Copy a verified backup off the VM first. The `--purge` option also deletes this installation's named volumes. It keeps host configuration and secret files.
+</Aside>
+
+To remove the installation and its project data, use:
+
+```bash
+./uninstall.sh --force --purge
+```
+
+Delete retained configuration and secrets only after you verify the backup and decide not to resume this installation.
+
+### Packages without `uninstall.sh`
+
+Fleet Manager starts runner containers outside Compose ownership. A Compose removal command can return success while a runner keeps the project network in use.
+
+Stop Fleet Manager so it cannot replace a runner during removal. Then stop the application so it cannot assign queued work. List the Compose services and managed runners:
+
+```bash
+docker compose --profile runners stop fleet-manager
+docker compose --profile runners stop app
+docker compose ps --all
+docker ps -a --filter label=superplane.managed-runner=true \
+  --format 'table {{.ID}}\t{{.Names}}\t{{.Networks}}'
+```
+
+The runner list can include other installations. Inspect each candidate's fleet label and network, then verify that network's Compose project label:
+
+```bash
+docker inspect your_runner_container_id \
+  --format '{{json .Config.Labels}} {{json .NetworkSettings.Networks}}'
+docker network inspect your_installation_network \
+  --format '{{json .Labels}}'
+```
+
+Remove only the exact runner IDs that you verified for this installation. Repeat these commands for each verified runner:
+
+```bash
+docker stop your_runner_container_id
+docker rm your_runner_container_id
+```
+
+Remove the Compose services and project network while preserving named volumes:
+
+```bash
+docker compose --profile runners down --remove-orphans
+```
+
+To delete project volumes too, add `-v` only after you copy a verified backup off the VM. Confirm that the selected runners and project network are absent. If removal reports a network still in use, inspect its attached containers before you continue. Do not use a global Docker prune command.
+
+After you resume an installation with preserved data, check both running runner containers and API capacity with the [diagnostic checks](/self-hosting/troubleshooting#collect-single-vm-diagnostics). The preserved database can retain stale runner records until reconciliation.
 
 ## Upgrade a cloud install
 
